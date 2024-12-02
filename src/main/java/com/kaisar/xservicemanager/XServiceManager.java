@@ -1,6 +1,7 @@
 package com.kaisar.xservicemanager;
 
 import android.annotation.SuppressLint;
+import android.app.ActivityManager;
 import android.content.Context;
 import android.os.Binder;
 import android.os.IBinder;
@@ -21,7 +22,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -36,8 +39,27 @@ public final class XServiceManager {
     private static final String DESCRIPTOR = XServiceManager.class.getName();
     private static final int TRANSACTION_getService = ('_'<<24)|('X'<<16)|('S'<<8)|'M';
 
+    private static final ArrayList<String> packageList = new ArrayList<>();
+    private static boolean isWhitelist = false;
+
     public interface ServiceFetcher<T extends Binder> {
         T createService(Context ctx);
+    }
+
+    public static void setWhiteList(boolean status) {
+        isWhitelist = status;
+    }
+
+    public static void addPackage(String packageName) {
+        packageList.add(packageName);
+    }
+
+    public static void addPackage(ArrayList<String> list) {
+        packageList.addAll(list);
+    }
+
+    public static void removePackage(String packageName) {
+        packageList.remove(packageName);
     }
 
     /**
@@ -59,11 +81,11 @@ public final class XServiceManager {
                 if ("addService".equals(methodName) && DELEGATE_SERVICE.equals(args[0])) {
                     IBinder clipboardService = (IBinder) args[1];
                     IBinder xServiceManagerService = new XServiceManagerService();
-                    args[1] = new BinderDelegateService(clipboardService, xServiceManagerService);
                     @SuppressLint("PrivateApi") Class<?> ActivityThreadClass = Class.forName("android.app.ActivityThread");
                     Method currentActivityThread = ActivityThreadClass.getMethod("currentActivityThread");
                     Method getSystemContext = ActivityThreadClass.getMethod("getSystemContext");
                     Context systemContext = (Context) getSystemContext.invoke(currentActivityThread.invoke(null));
+                    args[1] = new BinderDelegateService(clipboardService, xServiceManagerService, systemContext);
                     for (Map.Entry<String, ServiceFetcher<?>> serviceFetcherEntry : SERVICE_FETCHERS.entrySet()) {
                         String name = serviceFetcherEntry.getKey();
                         try {
@@ -98,19 +120,82 @@ public final class XServiceManager {
         return false;
     }
 
+    public static class CallingHelper {
+        private final Context context;
+        private ActivityManager activityManager = null;
+        private long lastCheckTime = 0;
+        private List<ActivityManager.RunningAppProcessInfo> lastProcessInfo = null;
+
+        public CallingHelper(Context context) {
+            this.context = context;
+        }
+
+        public String getCallingPackageName() {
+            return getCallingPackageName(Binder.getCallingUid(), Binder.getCallingPid());
+        }
+
+        public String getCallingPackageName(int uid, int pid) {
+            if (uid != -1) {
+                String[] packages = null;
+                try {
+                    packages = context.getPackageManager().getPackagesForUid(uid);
+                } catch (Exception e) {
+                    Log.e(TAG, "Get calling package name fail", e);
+                }
+                if (packages != null && packages.length >= 1) {
+                    return packages[0];
+                }
+            }
+            if (activityManager == null) {
+                activityManager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            }
+
+            if (activityManager == null) {
+                return null;
+            }
+
+            if (lastProcessInfo == null || System.currentTimeMillis() - lastCheckTime > 5000) {
+                lastProcessInfo = activityManager.getRunningAppProcesses();
+                lastCheckTime = System.currentTimeMillis();
+            }
+
+            for (ActivityManager.RunningAppProcessInfo processInfo : lastProcessInfo) {
+                if (processInfo.pid == pid || (pid == -1 && processInfo.uid == uid)) {
+                    return processInfo.processName;
+                }
+            }
+
+            return null;
+        }
+    }
+
     private static final class BinderDelegateService extends Binder {
 
         private final IBinder systemService;
         private final IBinder customService;
+        private final CallingHelper callingHelper;
 
-        public BinderDelegateService(IBinder systemService, IBinder customService) {
+        public BinderDelegateService(IBinder systemService, IBinder customService, Context context) {
             this.systemService = systemService;
             this.customService = customService;
+            this.callingHelper = new CallingHelper(context);
+        }
+
+        private boolean isAllowPackageName(String packageName) {
+            if (isWhitelist) {
+                return packageList.contains(packageName);
+            }
+            return !packageList.contains(packageName);
         }
 
         @Override
         protected boolean onTransact(int code, @NonNull Parcel data, @Nullable Parcel reply, int flags) throws RemoteException {
             if(code == TRANSACTION_getService){
+                String packageName = callingHelper.getCallingPackageName();
+                if (!isAllowPackageName(packageName)) {
+                    Log.d(TAG, String.format("reject %s service %s", packageName, data.readString()));
+                    return false;
+                }
                 return customService.transact(code, data, reply, flags);
             }
             return systemService.transact(code, data, reply, flags);
